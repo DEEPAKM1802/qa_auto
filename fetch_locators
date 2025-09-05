@@ -1,0 +1,146 @@
+import json
+import re
+from playwright.sync_api import sync_playwright
+
+
+def is_dynamic_selector(selector: str) -> bool:
+    """Detect dynamic selectors like auto-generated IDs or classes."""
+    return bool(re.search(r'(\d{3,}|\b[a-zA-Z0-9]{8,}\b)', selector))
+
+
+def get_xpath(page, element_handle):
+    """Generate unique XPath for an element."""
+    return element_handle.evaluate("""
+        el => {
+            function getElementXPath(elt) {
+                if (elt && elt.nodeType === 1) {
+                    if (elt.id)
+                        return '//' + elt.tagName.toLowerCase() + '[@id="' + elt.id + '"]';
+                    var sames = [];
+                    var siblings = elt.parentNode ? elt.parentNode.children : [];
+                    for (var i = 0; i < siblings.length; i++) {
+                        if (siblings[i].tagName === elt.tagName) {
+                            sames.push(siblings[i]);
+                        }
+                    }
+                    return getElementXPath(elt.parentNode) + '/' + elt.tagName.toLowerCase() +
+                           (sames.length > 1 ? '[' + (Array.prototype.indexOf.call(sames, elt) + 1) + ']' : '');
+                }
+            }
+            return getElementXPath(el);
+        }
+    """)
+
+
+def collect_locators(page):
+    """Collect interactable and visible locators from the page, grouped by class -> text -> attributes."""
+    grouped_data = {}
+
+    selectors = [
+        "button",
+        "input:not([type=hidden])",
+        "textarea",
+        "select",
+        "a[href]",
+        "[role=button]",
+        "[role=link]",
+        "[role=checkbox]",
+        "[role=radio]"
+    ]
+
+    for selector in selectors:
+        elements = page.query_selector_all(selector)
+        for el in elements:
+            try:
+                if not el.is_visible():
+                    continue
+
+                tag = el.evaluate("el => el.tagName.toLowerCase()")
+                text = el.inner_text().strip() if tag != "input" else (el.get_attribute("value") or "")
+                input_type = el.get_attribute("type") if tag == "input" else None
+                name_attr = el.get_attribute("name")
+                id_attr = el.get_attribute("id")
+                class_attr = el.get_attribute("class") or "no_class"
+
+                # Generate XPath
+                xpath = get_xpath(page, el)
+
+                # Ensure text key exists
+                if not text:
+                    text = f"{tag}_{id_attr or name_attr or 'no_text'}"
+
+                # Build entry
+                entry = {
+                    "xpath": xpath,
+                    "id": id_attr,
+                    "name": name_attr,
+                    "type": input_type
+                }
+
+                # Insert into grouped structure
+                if class_attr not in grouped_data:
+                    grouped_data[class_attr] = {}
+
+                grouped_data[class_attr][text] = entry
+
+            except Exception:
+                continue
+
+    return grouped_data
+
+
+def main(config):
+    playwright = sync_playwright().start()
+    browser = playwright.chromium.launch(headless=False)
+    page = browser.new_page()
+
+    # 1. Login
+    print("🔑 Logging in...")
+    page.goto(config["login_url"])
+    page.fill(config["selectors"]["email"], config["credentials"]["email"])
+    page.fill(config["selectors"]["password"], config["credentials"]["password"])
+    page.click(config["selectors"]["submit"])
+    page.wait_for_load_state("networkidle")
+
+    # 2. Redirect to target
+    print(f"➡️ Redirecting to {config['target_url']} ...")
+    page.goto(config["target_url"])
+    page.wait_for_load_state("networkidle")
+
+    # 3. Collect locators
+    print("🔍 Collecting locators...")
+    locators = collect_locators(page)
+
+    with open(config["output_file"], "w", encoding="utf-8") as f:
+        json.dump(locators, f, indent=4, ensure_ascii=False)
+
+    print(f"✅ Extracted {sum(len(v) for v in locators.values())} locators and saved to {config['output_file']}")
+
+    # 4. Logout
+    if config["selectors"].get("logout"):
+        print("🚪 Logging out...")
+        page.click(config["selectors"]["logout"])
+        page.wait_for_load_state("networkidle")
+
+    browser.close()
+    playwright.stop()
+
+
+if __name__ == "__main__":
+    config = {
+        "login_url": "https://example.com/login",
+        "target_url": "https://example.com/dashboard",
+        "output_file": "locators.json",
+        "credentials": {
+            "email": "test@example.com",
+            "password": "Password123"
+        },
+        "selectors": {
+            "email": "input[name='email']",
+            "password": "input[name='password']",
+            "submit": "button[type='submit']",
+            "logout": "text=Logout"
+        }
+    }
+
+    main(config)
